@@ -1,0 +1,1125 @@
+import math
+import threading
+
+import rospy
+from geometry_msgs.msg import Point
+from lanelet2.core import BasicPoint3d, LaneletLayer, GPSPoint, BasicPoint2d, Point3d, LineString2d, LaneletSequence, \
+    Polygon2d, AttributeMap
+from lanelet2.geometry import distance, length2d, project, to2D, angleAtProjectedPoint, distanceToCenterline2d, inside, \
+    interpolatedPointAtDistance, intersection2d, findWithin2d, \
+    toArcCoordinates, ArcCoordinates, fromArcCoordinates, signedDistance, accumulatedLengthRatios, length, align, \
+    overlapsPolygon2d, areaOfIntersectionPolygon, intersectLinestring2d
+from lanelet2.io import load, Origin
+from lanelet2.routing import RoutingGraph, LaneletPath, PossiblePathsParams
+from lanelet2.traffic_rules import create, Locations, Participants
+from vehicle_msgs.msg import Vehicle_info, Traffic_light_info, Pedestrian_info
+from visualization_msgs.msg import Marker, MarkerArray
+
+from Conflicting_lanelets import Conflicting_lanelets
+from ROW import ROW
+from utils import get_time, get_absolute_angle_diff, generate_lateral_profile, get_stopping_dist
+
+
+class Behaviour_planner:
+    def __init__(self, map_path, vehicle_current_info, max_info_obj, projector):
+        self.pub = rospy.Publisher('/points_marker', MarkerArray, queue_size=10)
+        self.map = load(map_path, projector)
+        self.traffic_rules = create(Locations.Germany, Participants.Vehicle)
+        self.graph = RoutingGraph(self.map, self.traffic_rules)
+        self.find_conflicting_lanelets = Conflicting_lanelets(self.map, self.graph)
+        self.vehicle = vehicle_current_info
+        self.marker_array = MarkerArray()
+
+        self.current_point = BasicPoint2d(self.vehicle.position_utm.x, self.vehicle.position_utm.y)
+        self.vehicle_corners = self.get_corners(self.current_point, self.vehicle.length, self.vehicle.width,
+                                                self.vehicle.orientation)
+        self.vehicle_polygon = Polygon2d(0, [Point3d(0, pt.x, pt.y) for pt in self.vehicle_corners], AttributeMap())
+        self.target_point = BasicPoint2d(self.vehicle.target_utm.x, self.vehicle.target_utm.y)
+
+        self.current_lanelet = self.find_lanelet(self.current_point)
+        self.target_lanelet = self.find_target_lanelet(self.target_point)
+
+        self.target_arc_co = toArcCoordinates(to2D(self.target_lanelet.centerline), self.target_point)
+
+        self.ego_arc_co = toArcCoordinates(to2D(self.current_lanelet.centerline), self.current_point)
+        self.target_final = BasicPoint2d(0, 0)
+        # if we need to replay friedrich's roundabout data from starting point
+        """  
+        dictionary = {1316: 's', 1322: 's',
+                      1330: 'r', 1336: 'r',
+                      1340: 'n', 1317: 'n',
+                      1338: 'l', 1315: 'l'}
+        type_of_travel = dictionary[self.current_lanelet.id] + dictionary[self.target_lanelet.id]
+        track_file = [csv_file for csv_file in os.listdir(rospy.get_param("/tracks_path")) if
+                      csv_file[-3:] == 'csv' and csv_file[:2] == type_of_travel][0]
+        df = pd.read_csv(rospy.get_param("/tracks_path") + '/' + track_file)[10:-10]
+        df['ones'] = np.ones(df.index.size)
+        transformation_matrix = np.array([[0.990650193880386, -0.135798238196248, -651.835988150159],
+                                          [0.135798238196248, 0.990650193880386, -75.0724716564077],
+                                          [0, 0, 1]])
+        ans = transformation_matrix.dot(df[['pos_x_dgps', 'pos_y_dgps', 'ones']].T).T
+        df['pos_x'] = ans[:, 0]
+        df['pos_y'] = ans[:, 1]
+        point_list = [Point3d(0, df.iloc[0]['pos_x'], df.iloc[0]['pos_y'], 0)]
+        for _, row in df.iterrows():
+            if math.sqrt((point_list[-1].x - row['pos_x']) ** 2 + (point_list[-1].y - row['pos_y']) ** 2) > 2:
+                point_list.append(Point3d(0, row['pos_x'], row['pos_y'], 0))
+        self.track_2d_cl = LineString2d(0, point_list)
+        if type_of_travel == 'sr' or type_of_travel == 'nl' or type_of_travel == 'ls' or type_of_travel == 'rn':
+            self.show_centerline(self.track_2d_cl)
+        """
+        self.distance_to_leave_in_front = 0
+        self.safe_front_dist = 3 + self.vehicle.length * 0.50
+        self.ll_route = self.graph.getRoute(self.current_lanelet, self.target_lanelet)
+        self.ll_map = self.ll_route.laneletSubmap()
+        self.ll_graph = RoutingGraph(self.ll_map, self.traffic_rules)
+
+        self.current_point_in_cl = project(to2D(self.current_lanelet.centerline), self.current_point)
+        self.target_point_in_cl = project(to2D(self.target_lanelet.centerline), self.target_point)
+
+        self.distance_per_lane_change = 12
+        try:
+            self.route = self.graph.shortestPath(self.current_lanelet, self.target_lanelet).getRemainingLane(
+                self.current_lanelet)
+        except:
+            raise Exception("No route to target")
+        self.route_final = self.route
+        self.yield_lanelets = []
+        self.row_lanelets = []
+        self.target_dist = 0.0
+
+        self.target_latitude = self.vehicle.target.latitude
+        self.target_longitude = self.vehicle.target.longitude
+
+        self.pedestrian_paths = [[BasicPoint2d(1000, 1000), BasicPoint2d(1000, 1001), BasicPoint2d(1000, 1002),
+                                  BasicPoint2d(1000, 1003)]
+                                 for _ in range(10)]
+        self.pedestrian_cg_pt = [BasicPoint2d(1000, 1000) for _ in range(10)]
+        self.pedestrian_ids = []
+        self.pedestrians = [Pedestrian_info() for _ in range(20)]
+        self.pedestrian_info_subscriber = rospy.Subscriber("/pedestrian_info", Pedestrian_info,
+                                                           self.update_pedestrian_info)
+        self.nearby_vehicles_obj_ids = []
+        self.nearby_vehicles = [Vehicle_info() for _ in range(200)]
+        self.nearby_vehicles_lanelet = [self.current_lanelet for _ in range(200)]
+        self.nearby_vehicles_route = [[] for _ in range(200)]
+        self.nearby_vehicles_cg_pt = [BasicPoint2d(0, 0) for _ in range(200)]  # this is not in cl
+        self.nearby_vehicles_corners = [[BasicPoint2d(0, 0) for _ in range(5)] for _ in range(200)]
+        self.nearby_vehicles_corners_polygon = [Polygon2d(0, [Point3d(0, pt.x, pt.y) for pt in self.vehicle_corners],
+                                                          AttributeMap()) for _ in range(200)]
+        self.nearby_vehicles_routes = [[] for _ in range(200)]
+        self.nearby_vehicles_prediction_polygons = [[] for _ in range(200)]
+        self.nearby_vehicles_lanelets = [{} for _ in range(200)]
+        self.nearby_vehicles_reachable_set = [{} for _ in range(200)]
+
+        #  self.veh_info_pub = rospy.Publisher('/vehicle_info', Vehicle_info, queue_size=100)
+        self.vehicle_info_subscriber = rospy.Subscriber("/vehicle_info", Vehicle_info, self.update_vehicle_info)
+        self.light_info_subscriber = rospy.Subscriber("/light_state", Traffic_light_info,
+                                                      self.update_traffic_light_info)
+        self.change_in_target = False
+
+        self.distance_between_vehicles = 0
+        self.publisher = rospy.Publisher('/target_marker_temp', Marker, queue_size=10)
+        self.marker = Marker()
+        self.marker.header.frame_id = "map"
+        self.marker.id = self.vehicle.obj_id
+        self.marker.type = self.marker.SPHERE
+        self.marker.action = self.marker.ADD
+        self.marker.scale.x = 2
+        self.marker.scale.y = 2
+        self.marker.scale.z = 2
+        self.marker.color.a = 1.0
+        self.marker.color.r = 0.0
+        self.marker.color.g = 0.0
+        self.marker.color.b = 0.0
+        color = rospy.get_param("color")
+        if color == "red":
+            self.marker.color.r = 1.0
+        elif color == "green":
+            self.marker.color.g = 1.0
+        elif color == "blue":
+            self.marker.color.b = 1.0
+        elif color == "yellow":
+            self.marker.color.r = 1.0
+            self.marker.color.g = 1.0
+        elif color == "majenta":
+            self.marker.color.g = 1.0
+            self.marker.color.b = 1.0
+        elif color == "cyan":
+            self.marker.color.r = 1.0
+            self.marker.color.b = 1.0
+        self.marker.pose.orientation.w = 1.0
+        self.marker.pose.position.x = 1.0
+        self.marker.pose.position.y = 1.0
+        self.marker.pose.position.z = 15
+
+        self.following_veh = False
+        self.max_info_obj = max_info_obj
+
+        self.row = ROW(self.map, self.graph)
+        self.path_points = None
+        self.rcl2d = to2D(self.route_final.centerline)
+
+    def thread_update_self_info(self, msg):
+        if msg.obj_id == self.vehicle.obj_id:
+            return
+        cg_pt = BasicPoint2d(msg.position_utm.x, msg.position_utm.y)
+        corners = self.get_corners(cg_pt, msg.length, msg.width, msg.orientation)
+        corners_polygon = Polygon2d(0, [Point3d(0, pt.x, pt.y) for pt in corners], AttributeMap())
+        # all_possible_lanelets = set([ll for _, ll in findWithin2d(self.map.laneletLayer, corners_polygon)])
+        all_possible_lanelets = set([ll for _, ll in findWithin2d(self.map.laneletLayer, Polygon2d(0, [
+            Point3d(0, corners[0].x, corners[0].y), Point3d(0, corners[1].x, corners[1].y),
+            Point3d(0, cg_pt.x, cg_pt.y)], AttributeMap()))])
+        # all_possible_lanelets = all_possible_lanelets - set([x for x in all_possible_lanelets for y in
+        #                                                     all_possible_lanelets if follows(y, x)])
+        if msg.obj_id in self.nearby_vehicles_obj_ids:
+            all_possible_lanelets = all_possible_lanelets.intersection(self.nearby_vehicles_reachable_set[msg.obj_id])
+        else:
+            if not all_possible_lanelets:
+                print("nothing really..................", cg_pt.x, cg_pt.y)
+                raise Exception("empty sequence")
+            delta_angles = [(abs(angleAtProjectedPoint(to2D(ll.centerline), cg_pt) - msg.orientation) + math.pi) %
+                            (2 * math.pi) - math.pi for ll in all_possible_lanelets]
+            must_lanelet = list(all_possible_lanelets)[delta_angles.index(min(delta_angles))]
+            all_possible_lanelets = set([ll for i, ll in enumerate(all_possible_lanelets) if delta_angles[i] < 0.34] +
+                                        [must_lanelet])
+
+        reachable_set = list(all_possible_lanelets)
+        possible_paths = []
+        this_dist_set = []
+        route_dist = max(20, msg.velocity * 4) if round(msg.velocity, 1) else max(7, msg.velocity * 4)
+        for ll in all_possible_lanelets:
+            reachable_set.extend(self.graph.following(ll, withLaneChanges=True))
+            ll_len = length2d(ll)
+            # reachable_set.extend(self.graph.reachableSet(ll, route_dist + ll_len))
+            this_dist = route_dist - (ll_len - toArcCoordinates(to2D(ll.centerline), cg_pt).length)
+            possible_paths.extend([path.getRemainingLane(ll) for path in self.graph.possiblePaths(
+                ll, PossiblePathsParams(routingCostLimit=this_dist, includeShorterPaths=True))])
+            this_dist_set.append(this_dist)
+
+        prediction_polygons = []
+        stop_dist = get_stopping_dist(msg.velocity, msg.acceleration, 6.0, self.max_info_obj.get_jerk_from_dec_max(6.0))
+        for path in possible_paths:
+            if any(lanelet in self.yield_lanelets for lanelet in path.lanelets()):
+                predict_dist = stop_dist
+            elif len(intersectLinestring2d(to2D(path.centerline), to2D(self.route.centerline))) == 1 and \
+                    signedDistance(to2D(self.route.centerline), cg_pt) > 0:  # veh is in intersection and in left
+                predict_dist = stop_dist
+            else:
+                predict_dist = msg.velocity
+            cg_pt_arc_length = toArcCoordinates(to2D(path.centerline), cg_pt).length
+            begin_length = max(0, cg_pt_arc_length - msg.length / 2.0)
+            end_length = min(cg_pt_arc_length + msg.length / 2.0 + predict_dist, length(to2D(path.centerline)))
+            left_length = length(to2D(path.leftBound))
+            right_length = length(to2D(path.rightBound))
+
+            start_pt_in_cl = interpolatedPointAtDistance(to2D(path.centerline), begin_length)
+            end_pt_in_cl = interpolatedPointAtDistance(to2D(path.centerline), end_length)
+
+            start_pt_in_lb = project(to2D(path.leftBound), start_pt_in_cl)
+            start_pt_in_rb = project(to2D(path.rightBound), start_pt_in_cl)
+            end_pt_in_lb = project(to2D(path.leftBound), end_pt_in_cl)
+            end_pt_in_rb = project(to2D(path.rightBound), end_pt_in_cl)
+
+            begin_length_lb = max(0, toArcCoordinates(to2D(path.leftBound), start_pt_in_lb).length)
+            begin_length_rb = max(0, toArcCoordinates(to2D(path.rightBound), start_pt_in_rb).length)
+            end_length_lb = min(toArcCoordinates(to2D(path.leftBound), end_pt_in_lb).length, left_length)
+            end_length_rb = min(toArcCoordinates(to2D(path.rightBound), end_pt_in_rb).length, right_length)
+
+            start_pt_in_lb = interpolatedPointAtDistance(to2D(path.leftBound), begin_length_lb)
+            start_pt_in_rb = interpolatedPointAtDistance(to2D(path.rightBound), begin_length_rb)
+            end_pt_in_lb = interpolatedPointAtDistance(to2D(path.leftBound), end_length_lb)
+            end_pt_in_rb = interpolatedPointAtDistance(to2D(path.rightBound), end_length_rb)
+
+            polygon_points = [Point3d(0, start_pt_in_cl.x, start_pt_in_cl.y),
+                              Point3d(0, start_pt_in_lb.x, start_pt_in_lb.y)]
+
+            lb, rb = align(path.leftBound, path.rightBound)
+            for i, val in enumerate([0] + accumulatedLengthRatios(to2D(lb))):
+                if val * left_length > begin_length_lb:
+                    if val * left_length >= end_length_lb:
+                        break
+                    polygon_points.append(Point3d(0, lb[i].x, lb[i].y))
+
+            polygon_points.extend([Point3d(0, end_pt_in_lb.x, end_pt_in_lb.y),
+                                   Point3d(0, end_pt_in_cl.x, end_pt_in_cl.y),
+                                   Point3d(0, end_pt_in_rb.x, end_pt_in_rb.y)])
+
+            temp_list = []
+            for i, val in enumerate([0] + accumulatedLengthRatios(to2D(rb))):
+                if begin_length_rb < val * right_length < end_length_rb:
+                    temp_list.append(Point3d(0, rb[i].x, rb[i].y))
+
+            polygon_points.extend(reversed(temp_list))
+            polygon_points.append(Point3d(0, start_pt_in_rb.x, start_pt_in_rb.y))
+
+            prediction_polygons.append(Polygon2d(0, polygon_points, AttributeMap()))
+
+        self.nearby_vehicles_cg_pt[msg.obj_id] = cg_pt
+        self.nearby_vehicles_corners[msg.obj_id] = corners
+        self.nearby_vehicles_corners_polygon[msg.obj_id] = corners_polygon
+        self.nearby_vehicles_reachable_set[msg.obj_id] = set(reachable_set)
+        self.nearby_vehicles_routes[msg.obj_id] = possible_paths
+        self.nearby_vehicles_lanelets[msg.obj_id] = all_possible_lanelets
+        self.nearby_vehicles_prediction_polygons[msg.obj_id] = prediction_polygons
+        self.nearby_vehicles[msg.obj_id] = msg
+        if msg.obj_id not in self.nearby_vehicles_obj_ids:
+            self.nearby_vehicles_obj_ids.append(msg.obj_id)
+
+    def update_vehicle_info(self, msg):
+        # self.thread_update_self_info(msg)
+        threading.Thread(target=self.thread_update_self_info, args=(msg,)).start()
+
+    def update_traffic_light_info(self, msg):
+        self.map.lineStringLayer[msg.id].attributes['state'] = msg.state
+
+    def update_pedestrian_info(self, msg):
+        self.pedestrians[msg.obj_id] = msg
+        self.pedestrian_cg_pt[msg.obj_id] = BasicPoint2d(msg.position_utm.x, msg.position_utm.y)
+        self.pedestrian_paths[msg.obj_id][1] = self.pedestrian_cg_pt[msg.obj_id]
+        self.pedestrian_paths[msg.obj_id][2].x = self.pedestrian_paths[msg.obj_id][1].x + 1 * msg.velocity * math.cos(
+            msg.orientation)
+        self.pedestrian_paths[msg.obj_id][2].y = self.pedestrian_paths[msg.obj_id][1].y + 1 * msg.velocity * math.sin(
+            msg.orientation)
+        self.pedestrian_paths[msg.obj_id][3].x = self.pedestrian_paths[msg.obj_id][2].x + 1 * msg.velocity * math.cos(
+            msg.orientation)
+        self.pedestrian_paths[msg.obj_id][3].y = self.pedestrian_paths[msg.obj_id][2].y + 1 * msg.velocity * math.sin(
+            msg.orientation)
+        self.pedestrian_paths[msg.obj_id][0].x = self.pedestrian_paths[msg.obj_id][1].x - 1.5 * msg.velocity * math.cos(
+            msg.orientation)
+        self.pedestrian_paths[msg.obj_id][0].y = self.pedestrian_paths[msg.obj_id][1].y - 1.5 * msg.velocity * math.sin(
+            msg.orientation)
+        if msg.obj_id not in self.pedestrian_ids:
+            self.pedestrian_ids.append(msg.obj_id)
+
+    def update_self_info(self, msg):
+        if msg.obj_id == self.vehicle.obj_id:
+            self.vehicle = msg
+            self.current_point = BasicPoint2d(self.vehicle.position_utm.x, self.vehicle.position_utm.y)
+            self.vehicle_corners = self.get_corners(self.current_point, self.vehicle.length, self.vehicle.width,
+                                                    self.vehicle.orientation)
+            self.vehicle_polygon = Polygon2d(0, [Point3d(0, pt.x, pt.y) for pt in self.vehicle_corners], AttributeMap())
+            self.target_point = BasicPoint2d(self.vehicle.target_utm.x, self.vehicle.target_utm.y)
+            self.current_lanelet = self.find_lanelet_current(self.current_point)
+            self.target_lanelet = self.find_target_lanelet(self.target_point)
+            self.current_point_in_cl = project(to2D(self.current_lanelet.centerline), self.current_point)
+            self.target_point_in_cl = project(to2D(self.target_lanelet.centerline), self.target_point)
+            self.route = self.get_ego_route(max(20, self.vehicle.velocity * 5))
+            # """
+            self.nearby_vehicles_obj_ids = [i for i in self.nearby_vehicles_obj_ids if
+                                            get_time(msg.stamp - self.nearby_vehicles[i].stamp) < 2.1]
+            self.pedestrian_ids = [i for i in self.pedestrian_ids if
+                                   get_time(msg.stamp - self.pedestrians[i].stamp) < 2.1]
+            # """
+
+    def get_ego_route(self, distance_required):
+        self.ll_route = self.ll_graph.getRoute(self.current_lanelet, self.target_lanelet)
+        if self.ll_route is None:
+            self.ll_route = self.graph.getRoute(self.current_lanelet, self.target_lanelet)
+            if self.ll_route is None:
+                self.emergency()
+                self.ll_route = self.ll_graph.getRoute(self.current_lanelet, self.current_lanelet)
+        self.ll_map = self.ll_route.laneletSubmap()
+        self.ll_graph = RoutingGraph(self.ll_map, self.traffic_rules)
+        shortest_path = self.ll_route.remainingShortestPath(self.current_lanelet)
+        # shortest_path_remaining_lane = shortest_path.getRemainingLane(self.current_lanelet)
+        # current_lane = max(self.ll_route.remainingLane(self.current_lanelet), shortest_path_remaining_lane,
+        #                   key=lambda x: len(x))
+        if not len(shortest_path):
+            shortest_path = LaneletPath([self.current_lanelet])
+        current_arc_coordinates = toArcCoordinates(to2D(self.current_lanelet.centerline), self.current_point)
+        changes, shortest_path_remaining_lane, current_lane = \
+            self.get_lane_change_information(self.ll_graph, self.ll_route, shortest_path)
+
+        """
+        dist_covered = - current_arc_coordinates.length
+        check_dist = get_stopping_dist(self.vehicle.velocity, self.vehicle.acceleration, self.max_info_obj.max_dec,
+                                       self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec)) + self.safe_front_dist
+        for ll in current_lane:
+            for j in sorted(self.nearby_vehicles_obj_ids,
+                            key=lambda x: distance(self.current_point, self.nearby_vehicles_cg_pt[x])):
+                if any(inside(ll, pt) for pt in self.nearby_vehicles_corners[j]):
+                    nearest_pt = min(self.nearby_vehicles_corners[j], key=lambda x: distance(x, self.current_point))
+                    delta_dist = toArcCoordinates(to2D(current_lane.centerline),
+                                                  nearest_pt).length - current_arc_coordinates.length
+                    if delta_dist < 0:
+                        continue
+                    distance_before_co = get_stopping_dist(
+                        self.nearby_vehicles[j].velocity, self.nearby_vehicles[j].acceleration,
+                        self.max_info_obj.max_dec + 2, self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2))
+                    if delta_dist + distance_before_co - 1.5 < check_dist:
+                        check_dist = 0
+                        break
+            dist_covered += length2d(ll)
+            if dist_covered >= check_dist:
+                break
+
+        if not changes and not check_dist:
+            dist_covered = - current_arc_coordinates.length
+            right_routable_lane = None
+            right_lane_length = 0
+            for i, ll in enumerate(current_lane):
+                if dist_covered >= self.distance_per_lane_change:
+                    break
+                dist_covered += length2d(ll)
+                r_lanelet = self.ll_graph.right(ll)
+                if r_lanelet:
+                    right_lane = max(self.ll_route.remainingLane(r_lanelet),
+                                     self.ll_route.remainingShortestPath(r_lanelet).getRemainingLane(r_lanelet),
+                                     key=lambda x: len(x))
+                    right_lane_length = sum(length2d(l_l) for l_l in right_lane) - toArcCoordinates(
+                        to2D(right_lane.centerline), self.current_point).length
+                    if right_lane_length > 4 * self.distance_per_lane_change:
+                        if self.can_i_go_to_this_lane(right_lane):
+                            right_routable_lane = right_lane
+                    break
+            dist_covered = - current_arc_coordinates.length
+            left_routable_lane = None
+            left_lane_length = 0
+            for i, ll in enumerate(current_lane):
+                if dist_covered >= self.distance_per_lane_change:
+                    break
+                dist_covered += length2d(ll)
+                l_lanelet = self.ll_graph.left(ll)
+                if l_lanelet:
+                    left_lane = max(self.ll_route.remainingLane(l_lanelet),
+                                    self.ll_route.remainingShortestPath(l_lanelet).getRemainingLane(l_lanelet),
+                                    key=lambda x: len(x))
+                    left_lane_length = sum(length2d(l_l) for l_l in left_lane) - toArcCoordinates(
+                        to2D(left_lane.centerline), self.current_point).length
+                    if left_lane_length > 4 * self.distance_per_lane_change:
+                        if self.can_i_go_to_this_lane(left_lane):
+                            left_routable_lane = left_lane
+                    break
+            if left_routable_lane and right_routable_lane:
+                if left_lane_length > right_lane_length:
+                    current_lane = left_routable_lane
+                    self.distance_to_leave_in_front += self.distance_per_lane_change
+                    self.current_lanelet = current_lane[0]
+                    self.current_point_in_cl = project(self.current_point, to2D(self.current_lanelet.centerline))
+                else:
+                    current_lane = right_routable_lane
+                    self.distance_to_leave_in_front += self.distance_per_lane_change
+                    self.current_lanelet = current_lane[0]
+                    self.current_point_in_cl = project(self.current_point, to2D(self.current_lanelet.centerline))
+            elif left_routable_lane:
+                current_lane = left_routable_lane
+                self.distance_to_leave_in_front += self.distance_per_lane_change
+                self.current_lanelet = current_lane[0]
+                self.current_point_in_cl = project(self.current_point, to2D(self.current_lanelet.centerline))
+            elif right_routable_lane:
+                current_lane = right_routable_lane
+                self.distance_to_leave_in_front += self.distance_per_lane_change
+                self.current_lanelet = current_lane[0]
+                self.current_point_in_cl = project(self.current_point, to2D(self.current_lanelet.centerline))
+        # """
+        flag = False
+        if changes:
+            dist_covered = - current_arc_coordinates.length
+            next_lane = self.ll_route.fullLane(shortest_path[len(shortest_path_remaining_lane)])
+            if changes[0] == 4:
+                right_lanelet_routable = None
+                for ll in [self.current_lanelet]:  # current_lane:
+                    # if dist_covered >= -1:#self.distance_per_lane_change:
+                    #    break
+                    dist_covered += length2d(ll)
+                    r_lanelet = self.ll_graph.right(ll)
+                    if r_lanelet and r_lanelet in next_lane:
+                        right_lanelet_routable = r_lanelet
+                        break
+
+                if right_lanelet_routable:
+                    possible_current_lane = max(self.ll_route.remainingLane(right_lanelet_routable),
+                                                self.ll_route.remainingShortestPath(
+                                                    right_lanelet_routable).getRemainingLane(
+                                                    right_lanelet_routable),
+                                                key=lambda x: len(x))
+                    if self.can_i_go_to_this_lane(possible_current_lane):
+                        print('taking right')
+                        flag = True
+                        current_lane = possible_current_lane
+                        self.current_lanelet = right_lanelet_routable
+                        self.current_point_in_cl = project(to2D(self.current_lanelet.centerline), self.current_point)
+                        self.distance_to_leave_in_front -= self.distance_per_lane_change
+            elif changes[0] == 2:
+                left_lanelet_routable = None
+                for ll in [self.current_lanelet]:  # current_lane:
+                    # if dist_covered >= -2:#self.distance_per_lane_change:
+                    #    break
+                    dist_covered += length2d(ll)
+                    l_lanelet = self.ll_graph.left(ll)
+                    if l_lanelet and l_lanelet in next_lane:
+                        left_lanelet_routable = l_lanelet
+                        break
+
+                if left_lanelet_routable:
+                    possible_current_lane = max(self.ll_route.remainingLane(left_lanelet_routable),
+                                                self.ll_route.remainingShortestPath(
+                                                    left_lanelet_routable).getRemainingLane(
+                                                    left_lanelet_routable),
+                                                key=lambda x: len(x))
+                    if self.can_i_go_to_this_lane(possible_current_lane):
+                        print('taking left')
+                        flag = True
+                        current_lane = possible_current_lane
+                        self.current_lanelet = left_lanelet_routable
+                        self.current_point_in_cl = project(to2D(self.current_lanelet.centerline), self.current_point)
+                        self.distance_to_leave_in_front -= self.distance_per_lane_change
+            else:
+                print('strange something new', self.vehicle.obj_id, changes)
+        self.route_final = current_lane
+        self.ego_arc_co = toArcCoordinates(to2D(self.current_lanelet.centerline), self.current_point)
+        # """
+        if flag:
+            def temp_function(data1):
+                a = ArcCoordinates()
+                a.length = data1[0] + self.ego_arc_co.length + 2.0
+                a.distance = data1[1]
+                return fromArcCoordinates(to2D(self.route_final.centerline), a)
+
+            path_points = generate_lateral_profile(self.ego_arc_co.distance, 30)
+            self.path_points = list(map(temp_function, path_points))
+        # """
+        if self.path_points:
+            val = toArcCoordinates(to2D(self.route_final.centerline), self.path_points[-1]).length
+            if val <= 0:
+                self.path_points = None
+                self.rcl2d = to2D(self.route_final.centerline)
+            else:
+                self.rcl2d = LineString2d(0, map(lambda point: Point3d(0, point.x, point.y),
+                                                 self.path_points + [pt for pt in to2D(self.route_final.centerline) if
+                                                                     toArcCoordinates(to2D(self.route_final.centerline),
+                                                                                      BasicPoint2d(pt.x, pt.y)).length >
+                                                                     val]))
+        else:
+            self.rcl2d = to2D(self.route_final.centerline)
+        required_current_lane = []
+        distance_required += self.ego_arc_co.length
+        dist_temp = 0
+        for ll in current_lane:
+            required_current_lane.append(ll)
+            dist_temp += length2d(ll)
+            if dist_temp >= distance_required:
+                break
+
+        yield_lanelets = []
+        row_lanelets = []
+        for ll in required_current_lane:
+            for el in ll.rightOfWay():
+                yield_lanelets.extend(el.yieldLanelets())
+                row_lanelets.extend(el.rightOfWayLanelets())
+
+        self.yield_lanelets = yield_lanelets
+        self.row_lanelets = row_lanelets
+        return LaneletSequence(required_current_lane)
+
+    def find_lanelet(self, p2d):
+        lanelet_list = [lanelet for lanelet in LaneletLayer.nearest(self.map.laneletLayer, p2d, 8) if
+                        lanelet.attributes['subtype'] == 'road']
+        return min(lanelet_list, key=lambda x: distanceToCenterline2d(x, p2d))
+
+    def find_target_lanelet(self, p2d):
+        lanelet_list = [ll for _, ll in findWithin2d(self.map.laneletLayer, p2d) if ll.attributes['subtype'] == 'road']
+        for ll in lanelet_list:
+            if self.graph.shortestPath(self.current_lanelet, ll):
+                return ll
+        print(self.current_lanelet.id, p2d.x, p2d.y, lanelet_list)
+        raise Exception("No route to target")
+
+    def find_pedestrian_lanelet(self, p2d):
+        lls = [ll for _, ll in findWithin2d(self.map.laneletLayer, p2d) if ll.attributes['subtype'] == 'walkway']
+        if lls:
+            return lls[0]
+        else:
+            return None
+
+    def find_lanelet_current_original(self, p2d):
+        return min(min(self.route, key=lambda x: distanceToCenterline2d(x, p2d)),
+                   min(self.route_final, key=lambda x: distanceToCenterline2d(x, p2d)),
+                   key=lambda x: distanceToCenterline2d(x, p2d))
+
+    def find_lanelet_current(self, p2d):
+        try:
+            lls = set([ll for ll in self.route] + [ll for ll in self.route_final])
+            lls = [ll for ll in lls if abs(get_absolute_angle_diff(angleAtProjectedPoint(to2D(ll.centerline), p2d) - self.vehicle.orientation)) < math.pi/3]
+            ll = min(lls, key=lambda x: distanceToCenterline2d(x, p2d))
+            return ll
+        except:
+            return min(min(self.route, key=lambda x: distanceToCenterline2d(x, p2d)),
+                       min(self.route_final, key=lambda x: distanceToCenterline2d(x, p2d)),
+                       key=lambda x: distanceToCenterline2d(x, p2d))
+
+    @staticmethod
+    def possibleReversePaths(graph, front_lane, dist):
+        lanes = [front_lane]
+        costs = [0]
+        while True:
+            finished_flag = True
+            for i, lane in enumerate(lanes):
+                prev = graph.previous(lane[0])
+                if costs[i] < dist and prev:
+                    finished_flag = False
+                    for ll in prev[1:]:
+                        lanes.append([ll] + lane)
+                        costs.append(costs[i] + length2d(ll))
+                    lanes[i].insert(0, prev[0])
+                    costs[i] += length2d(prev[0])
+            if finished_flag:
+                break
+        return [LaneletSequence(lane) for lane in lanes]
+
+    def get_lane_change_information(self, graph, route, shortest_path):
+
+        changes = []
+        shortest_path_remaining_lane = shortest_path.getRemainingLane(shortest_path[0])
+        num_lls_done = len(shortest_path_remaining_lane)
+
+        self.distance_to_leave_in_front = 0
+        add_during_next_lane_change = self.distance_per_lane_change
+        current_ll = shortest_path[0]
+        current_lane_to_send = max(route.remainingLane(current_ll),
+                                   route.remainingShortestPath(current_ll).getRemainingLane(current_ll),
+                                   key=lambda x: len(x))
+        current_lane = current_lane_to_send
+
+        while num_lls_done < len(shortest_path):
+            changes.append(graph.routingRelation(shortest_path[num_lls_done - 1], shortest_path[num_lls_done], True))
+            num_lls_done += len(shortest_path.getRemainingLane(shortest_path[num_lls_done]))
+
+            self.distance_to_leave_in_front += add_during_next_lane_change
+            if changes[-1] == 4:
+                current_ll = graph.right(current_lane[-1])
+            elif changes[-1] == 2:
+                current_ll = graph.left(current_lane[-1])
+            current_lane = max(route.remainingLane(current_ll),
+                               route.remainingShortestPath(current_ll).getRemainingLane(current_ll),
+                               key=lambda x: len(x))
+            if current_lane[0] == self.target_lanelet:
+                self.distance_to_leave_in_front += length2d(self.target_lanelet) - self.target_arc_co.length
+            add_during_next_lane_change = self.distance_per_lane_change - (
+                    sum([length2d(ll) for ll in current_lane]) - length2d(current_lane[0]))
+            if add_during_next_lane_change <= 0:
+                break
+        if not changes:
+            self.distance_to_leave_in_front = length2d(self.target_lanelet) - self.target_arc_co.length
+        return changes, shortest_path_remaining_lane, current_lane_to_send
+
+    def can_i_go_to_this_lane(self, current_lane):
+        ego_arc_co = toArcCoordinates(to2D(current_lane[0].centerline), self.current_point)
+        front_lane_dist = max(self.vehicle.velocity * 5, 20)
+        back_lane_dist = max([self.nearby_vehicles[i].velocity for i in self.nearby_vehicles_obj_ids] + [4]) * 5
+        if ego_arc_co.length > 0:
+            front_lane_dist += ego_arc_co.length
+            back_lane_dist -= ego_arc_co.length
+        else:
+            back_lane_dist += self.distance_per_lane_change
+        dist = 0
+        front_lane = []
+        for ll in current_lane:
+            front_lane.append(ll)
+            dist += length2d(ll)
+            if dist >= front_lane_dist:
+                break
+        lanes = self.possibleReversePaths(self.graph, front_lane, dist)
+        for lane in lanes:
+            ego_arc_co = toArcCoordinates(to2D(lane.centerline), self.current_point)
+            for j in self.nearby_vehicles_obj_ids:
+                if self.nearby_vehicles_lanelet[j] in lane:
+                    delta_dist = ego_arc_co.length - toArcCoordinates(to2D(lane.centerline), min(
+                        self.nearby_vehicles_corners[j], key=lambda x: distance(self.current_point, x))).length
+                    """
+                    if delta_dist > 0:  # ego is in front
+                        if delta_dist + get_stopping_dist(self.vehicle.velocity, self.vehicle.acceleration, 5.0,
+                                                          self.max_info_obj.get_jerk_from_dec_max(5.0)) - 10 < \
+                                max(get_stopping_dist(self.nearby_vehicles[j].velocity,
+                                                      self.nearby_vehicles[j].acceleration, 2.0,
+                                                      self.max_info_obj.get_jerk_from_dec_max(2.0)), 10):
+                            return False
+                    else:
+                        # -delta_dist + get_stopping_dist(self.nearby_vehicles[j].velocity,
+                        #                                                            self.nearby_vehicles[j].acceleration, self.max_info_obj.max_dec + 2,
+                        #                                                            self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2)) < self.distance_per_lane_change + self.safe_front_dist:
+                        if -delta_dist < self.distance_per_lane_change + self.safe_front_dist:
+                            return False
+                    """
+                    if delta_dist > 0:  # ego is in front
+                        if delta_dist + get_stopping_dist(self.vehicle.velocity, self.vehicle.acceleration, 5.0, self.max_info_obj.get_jerk_from_dec_max(5.0)) - 10 < \
+                                max(get_stopping_dist(self.nearby_vehicles[j].velocity,
+                                                      self.nearby_vehicles[j].acceleration, 2.0,
+                                                      self.max_info_obj.get_jerk_from_dec_max(2.0)), 10):
+                            return False
+                    else:
+                        if -delta_dist + get_stopping_dist(self.nearby_vehicles[j].velocity,
+                                                           self.nearby_vehicles[j].acceleration, 2.5,
+                                                           self.max_info_obj.get_jerk_from_dec_max(2.5)) < 8 + 6:
+                            return False
+
+        return True
+
+    @staticmethod
+    def get_corners(center, v_length, v_width, angle):
+        # front-left, front-right, back-right, back-left
+        wb2_sin = math.sin(angle) * v_width / 2.0
+        wb2_cos = math.cos(angle) * v_width / 2.0
+        lb2_sin = math.sin(angle) * v_length / 2.0
+        lb2_cos = math.cos(angle) * v_length / 2.0
+        return [BasicPoint2d(center.x + lb2_cos - wb2_sin, center.y + lb2_sin + wb2_cos),
+                BasicPoint2d(center.x + lb2_cos + wb2_sin, center.y + lb2_sin - wb2_cos),
+                BasicPoint2d(center.x - lb2_cos + wb2_sin, center.y - lb2_sin - wb2_cos),
+                BasicPoint2d(center.x - lb2_cos - wb2_sin, center.y - lb2_sin + wb2_cos)]
+
+    def following_check_final_1(self, route):
+        if not route:
+            return None
+        current_point = BasicPoint2d((self.vehicle_corners[1].x + self.vehicle_corners[2].x) / 2.0,
+                                     (self.vehicle_corners[1].y + self.vehicle_corners[2].y) / 2.0)
+        current_arc_length = toArcCoordinates(to2D(route.centerline), current_point).length
+
+        possible_vehicle = None
+        delta_dist_to_possible_vehicle = 100
+        for j in self.nearby_vehicles_obj_ids:
+            co_arc_length = toArcCoordinates(to2D(route.centerline), self.nearby_vehicles_cg_pt[j]).length
+            if co_arc_length - current_arc_length > 0:
+                for rte, poly in zip(self.nearby_vehicles_routes[j], self.nearby_vehicles_prediction_polygons[j]):
+                    if self.vehicle.obj_id == 3:
+                        self.publish_line_strip(poly)
+                    if areaOfIntersectionPolygon(route, poly) >= 0.5:
+                        if areaOfIntersectionPolygon(route, self.nearby_vehicles_corners_polygon[j]):
+                            nearest_point = min(self.nearby_vehicles_corners[j],
+                                                key=lambda x: distance(current_point, x))
+                            delta_dist = toArcCoordinates(to2D(route.centerline), nearest_point).length - \
+                                         current_arc_length
+                            if delta_dist < delta_dist_to_possible_vehicle:
+                                possible_vehicle = (j, nearest_point, True)  # True --> directly following
+                                delta_dist_to_possible_vehicle = delta_dist
+                        else:
+                            if any(lanelet in self.row_lanelets for lanelet in rte):
+                                continue
+                            nearest_point = min(intersection2d(route, rte), key=lambda x: distance(current_point, x))
+                            delta_dist = toArcCoordinates(to2D(route.centerline), nearest_point).length - \
+                                         current_arc_length
+                            if delta_dist < delta_dist_to_possible_vehicle:
+                                possible_vehicle = (j, nearest_point, False)  # False --> vehicle incoming sidewards
+                                delta_dist_to_possible_vehicle = delta_dist
+
+        if possible_vehicle:
+            if possible_vehicle[-1]:
+                delta_angle = get_absolute_angle_diff(
+                    self.nearby_vehicles[possible_vehicle[0]].orientation - angleAtProjectedPoint(
+                        to2D(route.centerline), self.nearby_vehicles_cg_pt[possible_vehicle[0]]))
+                distance_before_co = self.safe_front_dist - math.cos(delta_angle) * get_stopping_dist(
+                    self.nearby_vehicles[possible_vehicle[0]].velocity,
+                    self.nearby_vehicles[possible_vehicle[0]].acceleration,
+                    self.max_info_obj.max_dec + 2.5, self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2.5))
+                return possible_vehicle[1], max(0, delta_dist_to_possible_vehicle - distance_before_co)
+            else:
+                return possible_vehicle[1], max(0, delta_dist_to_possible_vehicle - self.safe_front_dist)
+
+    def following_check_final(self, route):
+        if not route:
+            return None
+        current_point = BasicPoint2d((self.vehicle_corners[1].x + self.vehicle_corners[2].x) / 2.0,
+                                     (self.vehicle_corners[1].y + self.vehicle_corners[2].y) / 2.0)
+        current_arc_length = toArcCoordinates(to2D(route.centerline), current_point).length
+
+        possible_vehicle = (None, None, 100)
+        for j in self.nearby_vehicles_obj_ids:
+            co_arc_length = toArcCoordinates(to2D(route.centerline), self.nearby_vehicles_cg_pt[j]).length
+            if co_arc_length - current_arc_length > 0:
+                for rte, poly in zip(self.nearby_vehicles_routes[j], self.nearby_vehicles_prediction_polygons[j]):
+                    #if self.vehicle.obj_id == 3:
+                    #    print "check 2"
+                    #    self.publish_line_strip(poly)
+                    if areaOfIntersectionPolygon(route, poly) >= 0.5:
+                        if not areaOfIntersectionPolygon(route, self.nearby_vehicles_corners_polygon[j]):
+                            if any(lanelet in self.row_lanelets for lanelet in rte):
+                                continue
+                        nearest_point = min(self.nearby_vehicles_corners[j], key=lambda x: distance(current_point, x))
+                        delta_dist = toArcCoordinates(to2D(route.centerline), nearest_point).length - \
+                                     current_arc_length
+                        if delta_dist < possible_vehicle[-1]:
+                            possible_vehicle = (j, nearest_point, delta_dist)
+
+        if possible_vehicle[0]:
+            delta_angle = get_absolute_angle_diff(
+                self.nearby_vehicles[possible_vehicle[0]].orientation - angleAtProjectedPoint(
+                    to2D(route.centerline), self.nearby_vehicles_cg_pt[possible_vehicle[0]]))
+            distance_before_co = self.safe_front_dist - math.cos(delta_angle) * get_stopping_dist(
+                self.nearby_vehicles[possible_vehicle[0]].velocity,
+                self.nearby_vehicles[possible_vehicle[0]].acceleration,
+                self.max_info_obj.max_dec + 2.5, self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2.5))
+            return possible_vehicle[1], max(0, possible_vehicle[-1] - distance_before_co)
+        return None
+
+    def following_a_vehicle_check(self, route):
+        if not route:
+            return None
+        current_point = BasicPoint2d((self.vehicle_corners[1].x + self.vehicle_corners[2].x) / 2.0,
+                                     (self.vehicle_corners[1].y + self.vehicle_corners[2].y) / 2.0)
+        current_arc_length = toArcCoordinates(to2D(route.centerline), current_point).length
+        possible_vehicles = []
+        polygons = []
+        paths = []
+
+        for j in self.nearby_vehicles_obj_ids:
+            for k, polygon in enumerate(self.nearby_vehicles_prediction_polygons[j]):
+                if round(areaOfIntersectionPolygon(route, polygon)) > 0.5:
+                    # if self.vehicle.obj_id == which_vehicle and j == seeing_which_vehicle:
+                    #     self.publish_line_strip(polygon)
+                    possible_vehicles.append(j)
+                    polygons.append(polygon)
+                    paths.append(self.nearby_vehicles_routes[j][k])
+                    break
+        closest_points = [min(self.nearby_vehicles_corners[j],
+                              key=lambda x: distance(x, current_point)) for j in possible_vehicles]
+        relative_arc_length = [toArcCoordinates(to2D(route.centerline), pt).length - current_arc_length
+                               for pt in closest_points]
+        op = zip(*[item for item in sorted(zip(relative_arc_length, closest_points, possible_vehicles, paths)) if
+                   item[0] > 0])
+        if not op:
+            return None
+        relative_arc_length, closest_points, possible_vehicles, paths = op
+        target_arc_co = toArcCoordinates(to2D(self.route_final.centerline), to2D(closest_points[0]))
+        linestring_length = target_arc_co.length - self.ego_arc_co.length
+        self.distance_between_vehicles = linestring_length
+        if overlapsPolygon2d(route, self.nearby_vehicles_corners_polygon[
+            possible_vehicles[0]]):  # any(ll in route for ll in self.nearby_vehicles_lanelets[possible_vehicles[0]]): #
+            distance_before_co = self.safe_front_dist - get_stopping_dist(
+                self.nearby_vehicles[possible_vehicles[0]].velocity,
+                self.nearby_vehicles[possible_vehicles[0]].acceleration,
+                self.max_info_obj.max_dec + 1, self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 1))  # 8.0 --> 5.0
+            return closest_points[0], max(0, linestring_length - distance_before_co)
+        else:
+            distance_before_co = self.safe_front_dist
+            points = intersection2d(route, paths[0])
+            if points:
+                closest_point = min(points, key=lambda x: distance(x, current_point))
+                linestring_length = toArcCoordinates(to2D(route.centerline), closest_point).length - current_arc_length
+                return closest_point, max(0, linestring_length - distance_before_co)
+            else:
+                print('strange.............................')
+
+    def following_a_vehicle_check_round_about(self, route, possible_front_vehicles):
+        if not route:
+            return None
+        current_point = BasicPoint2d((self.vehicle_corners[2].x + self.vehicle_corners[3].x) / 2.0,
+                                     (self.vehicle_corners[2].y + self.vehicle_corners[3].y) / 2.0)
+        current_arc_length = toArcCoordinates(to2D(route.centerline), current_point).length
+        possible_vehicles_details = []
+
+        for j in possible_front_vehicles:
+            nearest_point = min(self.nearby_vehicles_corners[j], key=lambda x: distance(x, current_point))
+            co_arc_length = toArcCoordinates(to2D(route.centerline), nearest_point).length
+            if co_arc_length - current_arc_length > 0:
+                possible_vehicles_details.append((co_arc_length - current_arc_length, j, nearest_point))
+
+        if not possible_vehicles_details:
+            return None
+
+        else:
+            front_vehicle = min(possible_vehicles_details)
+            delta_angle = self.nearby_vehicles[front_vehicle[1]].orientation - angleAtProjectedPoint(
+                to2D(route.centerline), self.nearby_vehicles_cg_pt[front_vehicle[1]])
+            distance_before_co = self.safe_front_dist - get_stopping_dist(
+                self.nearby_vehicles[front_vehicle[1]].velocity,
+                self.nearby_vehicles[front_vehicle[1]].acceleration,
+                self.max_info_obj.max_dec + 2.5, self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2.5))  # 8.0 --> 5.0
+            return front_vehicle[-1], max(0, math.cos(delta_angle) * (front_vehicle[0] - distance_before_co))
+
+    def right_of_way_check_round_about(self, route, possible_row_vehicles):
+        if len(route) <= 1 or not possible_row_vehicles:
+            return None
+        covered_els = []
+        for e, lanelet in enumerate(route):
+            for el in self.map.laneletLayer[lanelet.id].rightOfWay():
+                if el in covered_els:
+                    continue
+                covered_els.append(el)
+                if lanelet in el.rightOfWayLanelets():
+                    continue
+                if any(areaOfIntersectionPolygon(lane, self.vehicle_polygon) >= 0.5 for lane in
+                       self.row.lanes[el.id].row_lanes):
+                    continue
+                ego_lane = self.row.get_ego_lane(el, lanelet)
+                cl_2d = to2D(self.row.lanes[el.id].yield_lanes[ego_lane].centerline)
+                tgt_pt = self.row.target_points[el.id][ego_lane][0]
+                if toArcCoordinates(cl_2d, self.current_point).length > toArcCoordinates(cl_2d, tgt_pt).length:
+                    continue
+                for i, lane in enumerate(self.row.lanes[el.id].row_lanes):
+                    for j in possible_row_vehicles:  # self.nearby_vehicles_obj_ids:
+                        all_routes_lanelets = [l_l for rte in self.nearby_vehicles_routes[j] for l_l in rte]
+                        if any(ll in all_routes_lanelets for ll in lane.lanelets()):
+                            if toArcCoordinates(to2D(lane.centerline), self.nearby_vehicles_cg_pt[j]).length > \
+                                    toArcCoordinates(to2D(lane.centerline),
+                                                     self.row.intersection_points[el.id][ego_lane][i]).length:
+                                continue
+                            target_arc_co = toArcCoordinates(to2D(self.route_final.centerline), tgt_pt)
+                            target_dist = max(0, target_arc_co.length -
+                                              self.ego_arc_co.length - self.vehicle.length * 0.50 - 3.5)  # 0.5 is default
+                            if target_dist < 0 or \
+                                    target_dist < get_stopping_dist(self.vehicle.velocity,
+                                                                    self.vehicle.acceleration,
+                                                                    6.0,
+                                                                    self.max_info_obj.get_jerk_from_dec_max(6.0)):
+                                continue
+                            return tgt_pt, target_dist
+        return None
+
+    def right_of_way_check(self):
+        if len(self.route) <= 1:  # anyway the vehicle is not going to cross the current lanelet in 4.5 seconds
+            return None
+        covered_els = []
+        possible_vehicles = [j for j in self.nearby_vehicles_obj_ids if not overlapsPolygon2d(
+            self.route, self.nearby_vehicles_corners_polygon[j])]
+        for e, lanelet in enumerate(self.route):
+            for el in self.map.laneletLayer[lanelet.id].rightOfWay():
+                if el in covered_els:
+                    continue
+                covered_els.append(el)
+                if lanelet in el.rightOfWayLanelets():
+                    continue
+                if any(overlapsPolygon2d(lane, self.vehicle_polygon) for lane in self.row.lanes[el.id].row_lanes):
+                    continue
+                ego_lane = self.row.get_ego_lane(el, lanelet)
+                cl_2d = to2D(self.row.lanes[el.id].yield_lanes[ego_lane].centerline)
+                if toArcCoordinates(cl_2d, self.current_point_in_cl).length > \
+                        toArcCoordinates(cl_2d, self.row.target_points[el.id][ego_lane][0]).length:
+                    continue
+
+                for i, lane in enumerate(self.row.lanes[el.id].row_lanes):
+                    for j in possible_vehicles:  # self.nearby_vehicles_obj_ids:
+                        all_routes_lanelets = [l_l for route in self.nearby_vehicles_routes[j] for l_l in route]
+                        if any(ll in all_routes_lanelets for ll in lane.lanelets()):
+                            if toArcCoordinates(to2D(lane.centerline), self.nearby_vehicles_cg_pt[j]).length > \
+                                    toArcCoordinates(to2D(lane.centerline),
+                                                     self.row.intersection_points[el.id][ego_lane][i]).length:
+                                continue
+                            tgt_pt = self.row.target_points[el.id][ego_lane][0]
+                            target_arc_co = toArcCoordinates(to2D(self.route_final.centerline), tgt_pt)
+                            target_dist = max(0, target_arc_co.length -
+                                              self.ego_arc_co.length - self.vehicle.length * 0.50 - 0.5)
+                            if target_dist < 0 or \
+                                    target_dist < get_stopping_dist(self.vehicle.velocity,
+                                                                    self.vehicle.acceleration,
+                                                                    6.0,
+                                                                    self.max_info_obj.get_jerk_from_dec_max(6.0)):
+                                continue
+                            return tgt_pt, target_dist
+        return None
+
+    def traffic_light_check(self):
+        for i, lanelet in enumerate(self.route):
+            for light_reg_elem in self.map.laneletLayer[lanelet.id].trafficLights():
+                if 'red' in [lt.attributes['state'] for lt in light_reg_elem.trafficLights]:  # we have to stop
+                    linestring_length = max(
+                        sum(length2d(self.route[j]) for j in range(i + 1)) - self.ego_arc_co.length - 5.0, 0)
+                    if linestring_length < get_stopping_dist(self.vehicle.velocity, self.vehicle.acceleration,
+                                                             self.max_info_obj.max_dec + 2.5,
+                                                             self.max_info_obj.get_jerk_from_dec_max(self.max_info_obj.max_dec + 2.5)):
+                        continue
+                    return to2D(lanelet.centerline[-1]), linestring_length
+        return None
+
+    def pedestrian_check_final_old(self):
+        rcl_2d = to2D(self.route.centerline)
+        for i, lanelet in enumerate(self.route):
+            for j in self.pedestrian_ids:
+                if any(inside(lanelet, pt) for pt in self.pedestrian_paths[j]):
+                    ped_arc_co = toArcCoordinates(rcl_2d, self.pedestrian_cg_pt[j])
+                    val = ped_arc_co.length - self.ego_arc_co.length - 0.50 * self.vehicle.length
+                    if val <= 0:
+                        continue
+                    return self.pedestrian_cg_pt[j], max(0, val - 5.0)
+        return None
+
+    def pedestrian_check_final(self):
+        if self.vehicle.obj_id == 1:
+            d = 3.5
+        else:
+            d = 4.5
+        rcl_2d = to2D(self.route.centerline)
+        rll_2d = to2D(self.route.leftBound)
+        rrl_2d = to2D(self.route.rightBound)
+
+        possible_list = []
+
+        for j in self.pedestrian_ids:
+            intersection_points_cl = intersectLinestring2d(rcl_2d, self.pedestrian_paths[j][0], self.pedestrian_paths[j][-1])
+            intersection_points_rl = intersectLinestring2d(rrl_2d, self.pedestrian_paths[j][0], self.pedestrian_paths[j][-1])
+            intersection_points_ll = intersectLinestring2d(rll_2d, self.pedestrian_paths[j][0], self.pedestrian_paths[j][-1])
+
+            if any([inside(lanelet, pt) for pt in self.pedestrian_paths[j] for lanelet in self.route]) or intersection_points_cl or intersection_points_ll or intersection_points_rl:
+                ped_arc_co = toArcCoordinates(rcl_2d, self.pedestrian_cg_pt[j])
+                val = ped_arc_co.length - self.ego_arc_co.length - 0.50 * self.vehicle.length
+                possible_list.append([self.pedestrian_cg_pt[j], max(0, val - d)])
+
+        if possible_list:
+            return min(possible_list, key=lambda x: x[-1])
+        else:
+            return None
+
+    def conflict_check(self):
+        for i, lanelet in enumerate(self.route[:-1]):
+            for c_lanelet in self.find_conflicting_lanelets.conflicting[lanelet.id]:
+                for k in self.nearby_vehicles_obj_ids:
+                    if c_lanelet in self.nearby_vehicles_route[k][1:]:
+                        intersection_points = intersection2d(lanelet, c_lanelet)
+                        if c_lanelet == self.nearby_vehicles_lanelet[k]:
+                            farthest_point = max(intersection_points,
+                                                 key=lambda c: distance(c, to2D(c_lanelet.centerline[0])))
+                            if distance(self.nearby_vehicles_cg_pt[k], to2D(c_lanelet.centerline[0])) > distance(
+                                    farthest_point, to2D(c_lanelet.centerline[0])):
+                                continue
+                        lengths_along_centerline = [toArcCoordinates(to2D(lanelet.centerline), x) for x in
+                                                    intersection_points]
+                        min_length = min(lengths_along_centerline)
+                        linestring_length = max(0, min_length - self.ego_arc_co.length - 3.0)
+                        if linestring_length < get_stopping_dist(self.vehicle.velocity, self.vehicle.acceleration,
+                                                                 6.0, self.max_info_obj.get_jerk_from_dec_max(6.0)):
+                            continue
+                        return intersection_points[lengths_along_centerline.index(min_length)], linestring_length
+        return None
+
+    def solve_multiple_lanelet_crossing_problem(self, route_final):
+        pass
+
+    def compute(self):
+        # """
+        lanelet_list = []
+        if not inside(self.current_lanelet, self.current_point):
+            if signedDistance(to2D(self.current_lanelet.centerline), self.current_point) < 0:
+                for ll in self.route:
+                    r_ll = self.graph.right(ll)
+                    if not r_ll:
+                        r_ll = self.graph.adjacentRight(ll)
+                    if not r_ll:
+                        break
+                    lanelet_list.append(r_ll)
+            else:
+                for ll in self.route:
+                    l_ll = self.graph.left(ll)
+                    if not l_ll:
+                        l_ll = self.graph.adjacentLeft(ll)
+                    if not l_ll:
+                        break
+                    lanelet_list.append(l_ll)
+        # """
+        """
+        targets = [i for i in [self.following_a_vehicle_check(), self.traffic_light_check(), self.right_of_way_check(),
+                               # self.conflict_check()
+                               self.compute_final(), self.pedestrian_check()] if
+                   not i == 0]  # self.conflict_check()
+        """
+        """
+        pre_lane_change_target = self.following_a_vehicle_check(LaneletSequence(lanelet_list))
+        if pre_lane_change_target:
+            pt = interpolatedPointAtDistance(self.rcl2d, toArcCoordinates(self.rcl2d, self.current_point).length +
+                                             pre_lane_change_target[1])
+            if any(inside(ll, pt) for ll in self.route_final):
+                pre_lane_change_target = None
+        """
+        final_target = self.target_point_in_cl, max(sum(length2d(ll) for ll in self.route_final) -
+                                                    self.ego_arc_co.length - self.distance_to_leave_in_front, 0)
+
+        """
+        if self.distance_to_leave_in_front:
+            final_target = to2D(self.route_final[-1].centerline[-1]), \
+                           max(sum(length2d(ll) for ll in self.route_final) -
+                               self.ego_arc_co.length - self.distance_to_leave_in_front, 0)
+        else:
+            final_target = self.target_point_in_cl, max(
+                toArcCoordinates(to2D(self.route_final.centerline),
+                                 to2D(self.target_point_in_cl)).length - self.ego_arc_co.length, 0)
+        """
+        possible_front_vehicles = [j for j in self.nearby_vehicles_obj_ids if
+                                   areaOfIntersectionPolygon(self.route, self.nearby_vehicles_corners_polygon[j])
+                                   >= 0.1]
+        possible_row_vehicles = list(set(self.nearby_vehicles_obj_ids) - set(possible_front_vehicles))
+        all_targets = [final_target,
+                       self.following_check_final(self.route),
+                       self.following_check_final(LaneletSequence(lanelet_list)),
+                       self.right_of_way_check_round_about(self.route, possible_row_vehicles),
+                       self.pedestrian_check_final(),
+                       self.traffic_light_check()]
+
+        targets = [i for i in all_targets if i]
+        index = 0
+        value = targets[0][1]
+        for i in range(1, len(targets)):
+            if targets[i][1] < value:
+                value = targets[i][1]
+                index = i
+
+        self.target_dist = targets[index][1]
+        pt = interpolatedPointAtDistance(to2D(self.route_final.centerline), self.ego_arc_co.length + self.target_dist)
+        if distance(self.target_final, pt) <= 3:
+            self.change_in_target = False
+        # if round(self.target_final.x, 1) == round(targets[index][0].x, 1) and \
+        #        round(self.target_final.y, 1) == round(targets[index][0].y, 1):
+        #    self.change_in_target = False
+        else:
+            self.change_in_target = True
+            self.target_final = pt  # targets[index][0]
+
+        self.target_dist = targets[index][1]
+        # print(self.target_dist)
+
+        # pt = self.projector.forward(GPSPoint(self.target_latitude, self.target_longitude))
+        # self.marker.pose.position.x = self.target_final.x
+        # self.marker.pose.position.y = self.target_final.y
+
+        pt = interpolatedPointAtDistance(self.route_final.centerline, self.ego_arc_co.length + self.target_dist)
+        self.marker.pose.position.x = pt.x
+        self.marker.pose.position.y = pt.y
+        # self.marker.pose.position.x = self.target_final.x
+        # self.marker.pose.position.y = self.target_final.y
+
+        self.publisher.publish(self.marker)
+        # self.show_centerline(self.rcl2d)
+
+    def show_centerline(self, line_string):
+        self.marker_array.markers = [Marker() for _ in range(len(line_string))]
+
+        for i in range(len(self.marker_array.markers)):
+            self.marker_array.markers[i].header.frame_id = "/map"
+            self.marker_array.markers[i].id = 1000 * self.vehicle.obj_id + i
+            self.marker_array.markers[i].type = self.marker_array.markers[i].SPHERE
+            self.marker_array.markers[i].action = self.marker_array.markers[i].ADD
+            self.marker_array.markers[i].scale.x = 1.5
+            self.marker_array.markers[i].scale.y = 1.5
+            self.marker_array.markers[i].scale.z = 1.5
+            self.marker_array.markers[i].color.a = 1.0
+            self.marker_array.markers[i].color.r = 0.0
+            self.marker_array.markers[i].color.g = 0.0
+            self.marker_array.markers[i].color.b = 1.0
+            self.marker_array.markers[i].pose.orientation.w = 1.0
+            self.marker_array.markers[i].pose.position.x = line_string[i].x
+            self.marker_array.markers[i].pose.position.y = line_string[i].y
+            self.marker_array.markers[i].pose.position.z = 0
+            # self.pub.publish(self.marker_array.markers[i])
+        self.pub.publish(self.marker_array)
+
+    def publish_line_strip(self, points):
+        self.marker_array.markers = [Marker()]
+        i = 0
+        self.marker_array.markers[i].action = self.marker_array.markers[i].DELETEALL
+        self.pub.publish(self.marker_array)
+
+        self.marker_array.markers[i].header.frame_id = "/map"
+        self.marker_array.markers[i].id = 1000 * self.vehicle.obj_id + i
+        self.marker_array.markers[i].type = self.marker_array.markers[i].LINE_STRIP
+        self.marker_array.markers[i].action = self.marker_array.markers[i].ADD
+        self.marker_array.markers[i].scale.x = 1
+        self.marker_array.markers[i].color.a = 1.0
+        self.marker_array.markers[i].color.r = 1.0
+        self.marker_array.markers[i].color.g = 0.0
+        self.marker_array.markers[i].color.b = 1.0
+        self.marker_array.markers[i].points = [Point(pt.x, pt.y, 0) for pt in points]
+        self.marker_array.markers[i].points.append(self.marker_array.markers[i].points[0])
+        # self.pub.publish(self.marker_array.markers[i])
+        self.pub.publish(self.marker_array)
+
+    @staticmethod
+    def emergency():
+        print('emergency')
+        rospy.set_param("/emergency", True)
